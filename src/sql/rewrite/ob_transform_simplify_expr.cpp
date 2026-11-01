@@ -2639,6 +2639,107 @@ int ObTransformSimplifyExpr::remove_duplicate_exprs(ObQueryCtx* query_ctx,
   }
   return ret;
 }
+static int merge_range_predicates(ObSEArray<ObRawExpr *, 4> &in_conds,
+                                ObSEArray<ObRawExpr *, 4> &out_conds,
+                                ObQueryCtx &query_ctx)
+{
+  int ret = OB_SUCCESS;
+  out_conds.reset();
+  ObExprFactory *factory = query_ctx.ctx->expr_factory_;
+  if (OB_ISNULL(factory)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("expr factory is null", K(ret));
+    return ret;
+  }
+
+  struct BestCond
+  {
+    ObRawExpr * col_;
+    ObExprOpType op_;
+    ObRawExpr * expr_;
+  };
+  ObSEArray<BestCond, 4> best_list;
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < in_conds.count(); ++i) {
+    ObRawExpr *e = in_conds.at(i);
+    if (OB_ISNULL(e)) {
+      continue;
+    }
+    if (e->get_expr_type() != T_OP_LT && e->get_expr_type() != T_OP_LE
+        && e->get_expr_type() != T_OP_GT && e->get_expr_type() != T_OP_GE) {
+      if (OB_FAIL(out_conds.push_back(e))) {
+        LOG_WARN("push non-range expr fail", K(ret));
+      }
+      continue;
+    }
+
+    ObOpRawExpr *cmp_expr = static_cast<ObOpRawExpr*>(e);
+    if (cmp_expr->.get_param_count() != 2) {
+      if (OB_FAIL(out_conds.push_back(e))) {
+        LOG_WARN("push expr fail", K(ret));
+      }
+      continue;
+    }
+    ObRawExpr *left = cmp_expr->get_param_expr(0);
+    ObRawExpr *right = cmp_expr->get_param_expr(1);
+    if (!left->is_column_expr() || !right->is_const_expr()) {
+      if (OB_FAIL(out_conds.push_back(e))) {
+        LOG_WARN("push expr fail", K(ret));
+      }
+      continue;
+    }
+    ObConstRawExpr * const_expr = static_cast<ObConstRawExpr*>(right);
+    const ObObj &val = const_expr->get_value();
+
+    bool found = false;
+    for (int64_t j = 0; j < best_list.count(); ++j) {
+      BestCond &bc = best_list.at(j);
+      if (bc.col_ == left && bc.op_ == static_cast<ObExprOpType>(e->get_expr_type())) {
+        found = true;
+        ObOpRawExpr * old_cmp = static_cast<ObOpRawExpr*>(bc.expr_);
+        ObConstRawExpr * old_const = static_cast<ObConstRawExpr*>(old_cmp->get_param_expr(1));
+        const ObObj &old_val = old_const->get_value();
+        bool replace = false;
+        if (e->get_expr_type() == T_OP_LT || e->get_expr_type() == T_OP_LE) {
+          if ((val < old_val)) {
+            replace = true;
+          }
+        } else {
+          if ((val > old_val)) {
+            replace = true;
+          }
+        }
+        if (replace) {
+          bc.expr_ = e;
+        }
+        break;
+      }
+    }
+    if (!found) {
+      BestCond new_bc;
+      new_bc.col_ = left;
+      new_bc.op_ = static_cast<ObExprOpType>(e->get_expr_type());
+      new_bc.expr_ = e;
+      if (OB_FAIL(best_list.push_back(new_bc))) {
+        LOG_WARN("push best cond to list fail", K(ret));
+        break;
+      }
+    }
+  }
+
+  for (int64_t j = 0; OB_SUCC(ret) && j < best_list.count(); ++j) {
+    if (OB_FAIL(out_conds.push_back(best_list.at(j).expr_))) {
+      LOG_WARN("push final best cond fail", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && out_conds.empty()) {
+    if (OB_FAIL(out_conds.assign(in_conds))) {
+      LOG_WARN("assign back origin conds fail", K(ret));
+    }
+  }
+  return ret;
+}
 
 int ObTransformSimplifyExpr::recursive_remove_duplicate_exprs(ObQueryCtx &query_ctx,
                                                               ObRawExpr* &expr,
@@ -2666,7 +2767,24 @@ int ObTransformSimplifyExpr::recursive_remove_duplicate_exprs(ObQueryCtx &query_
         /* use too much resource and need add lots of constraints */
       } else if (OB_FAIL(param_conds.assign(op_expr->get_param_exprs()))) {
       } else if (OB_FAIL(do_remove_duplicate_exprs(query_ctx, param_conds))) {
-      } else if (param_conds.count() == op_expr->get_param_count()) {
+      } 
+      else
+	{
+	    ObSEArray<ObRawExpr *, 4> merged_conds;
+	    if (OB_FAIL(merge_range_predicates(param_conds, merged_conds, query_ctx)))
+	    {
+		LOG_WARN("merge range predicates failed", K(ret));
+	    }
+	    else
+	    {
+		param_conds.reset();
+		if (OB_FAIL(param_conds.assign(merged_conds)))
+		{
+		    LOG_WARN("assign merged conds failed", K(ret));
+		}
+	    }
+	}
+      else if (param_conds.count() == op_expr->get_param_count()) {
         //do nothing
       } else if (param_conds.count() == 1) {
         ObRawExpr *temp = NULL;
